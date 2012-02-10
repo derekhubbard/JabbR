@@ -14,6 +14,8 @@
         isUnreadMessageForUser = false,
         focus = true,
         loadingHistory = false,
+        checkingStatus = false,
+        typing = false,
         typingTimeoutId = null,
         $ui = $(ui);
 
@@ -52,10 +54,9 @@
         chat.getRoomInfo(room)
                 .done(function (roomInfo) {
                     $.each(roomInfo.Users, function () {
-                        var viewModel = getUserViewModel(this);
-
-                        ui.addUser(viewModel, room);
-                        ui.setUserActivity(viewModel);
+                        var userViewModel = getUserViewModel(this);
+                        ui.addUser(userViewModel, room);
+                        ui.setUserActivity(userViewModel);
                     });
 
                     $.each(roomInfo.Owners, function () {
@@ -124,24 +125,19 @@
             message: message.Content,
             id: message.Id,
             date: message.When.fromJsonDate(),
-            highlight: re.test(message.Content) ? 'highlight' : ''
+            highlight: re.test(message.Content) ? 'highlight' : '',
+            isOwn: re.test(chat.name)
         };
     }
 
     // Save some state in a cookie
     function updateCookie() {
-        var legacyCookies = ['userid', 'username', 'userroom', 'userhash', 'currentroom'],
-            state = {
-                userId: chat.id,
-                activeRoom: chat.activeRoom,
-                preferences: ui.getState()
-            },
-            jsonState = window.JSON.stringify(state);
-
-        // Clear the legacy cookies
-        $.each(legacyCookies, function () {
-            $.cookie(this, null);
-        });
+        var state = {
+            userId: chat.id,
+            activeRoom: chat.activeRoom,
+            preferences: ui.getState()
+        },
+        jsonState = window.JSON.stringify(state);
 
         $.cookie('jabbr.state', jsonState, { path: '/', expires: 30 });
     }
@@ -212,6 +208,7 @@
         ui.addMessage('Welcome back ' + chat.name, 'notification', 'lobby');
         ui.addMessage('You can join any of the rooms on the right', 'notification', 'lobby');
         ui.addMessage('Type /rooms to list all available rooms', 'notification', 'lobby');
+        ui.addMessage('Type /logout to log out of chat', 'notification', 'lobby');
 
         // Process any urls that may contain room names
         ui.run();
@@ -302,6 +299,11 @@
         }, room);
 
         var isMentioned = viewModel.highlight === 'highlight';
+
+        // Fix #369 - do not update unread count if own message
+        if (viewModel.isOwn) {
+            return;
+        }
 
         updateUnread(room, isMentioned);
     };
@@ -414,16 +416,27 @@
 
         updateCookie();
 
-        // Restart the connection
-        connection.stop();
-        connection.start();
+        // Reload the page
+        document.location = document.location.pathname;
     };
 
     chat.showUserInfo = function (userInfo) {
         var lastActivityDate = userInfo.LastActivity.fromJsonDate();
         var status = "Currently " + userInfo.Status;
+        if (userInfo.IsAfk) {
+            status += userInfo.Status == 'Active' ? ' but ' : ' and ';
+            status += ' is Afk';
+        }
         ui.addMessage('User information for ' + userInfo.Name +
             " (" + status + " - last seen " + $.timeago(lastActivityDate) + ")", 'list-header');
+
+        if (userInfo.AfkNote) {
+            ui.addMessage('Afk: ' + userInfo.AfkNote, 'list-item');
+        }
+        else if (userInfo.Note) {
+            ui.addMessage('Note: ' + userInfo.Note, 'list-item');
+        }
+
         chat.showUsersOwnedRoomList(userInfo.Name, userInfo.OwnedRooms);
     };
 
@@ -490,9 +503,9 @@
         ui.addMessage('Your name is now ' + user.Name, 'notification', this.activeRoom);
     };
 
-    chat.setTyping = function (user, room, isTyping) {
+    chat.setTyping = function (user, room) {
         var viewModel = getUserViewModel(user);
-        ui.setUserTyping(viewModel, room, isTyping);
+        ui.setUserTyping(viewModel, room);
     };
 
     chat.sendMeMessage = function (name, message, room) {
@@ -569,7 +582,7 @@
                 return a.Count > b.Count ? -1 : 1;
             });
 
-            $.each(rooms, function () {
+            $.each(sorted, function () {
                 ui.addMessage(this.Name + ' (' + this.Count + ')', 'list-item');
             });
         }
@@ -631,31 +644,28 @@
             return;
         }
 
-        // Clear any previous timeout
-        if (typingTimeoutId) {
-            clearTimeout(typingTimeoutId);
-        }
-        else {
-            // Otherwise, mark as typing
-            chat.typing(true);
-        }
+        if (checkingStatus === false && typing === false) {
+            typing = true;
 
-        // Set timeout to turn off
-        typingTimeoutId = window.setTimeout(function () {
-            typingTimeoutId = 0;
-            chat.typing(false);
-        }, 3000);
+            chat.typing(chat.activeRoom);
+
+            window.setTimeout(function () {
+                typing = false;
+            },
+            3000);
+        }
     });
 
     $ui.bind(ui.events.sendMessage, function (ev, msg) {
-        chat.send(msg)
+        chat.send(msg, chat.activeRoom)
+            .done(function (requiresUpdate) {
+                if (requiresUpdate === true) {
+                    ui.showUpdateUI();
+                }
+            })
             .fail(function (e) {
                 ui.addMessage(e, 'error');
             });
-
-        clearTimeout(typingTimeoutId);
-        typingTimeoutId = 0;
-        chat.typing(false);
 
         // Store message history
         messageHistory.push(msg);
@@ -677,7 +687,7 @@
     });
 
     $ui.bind(ui.events.openRoom, function (ev, room) {
-        chat.send('/join ' + room)
+        chat.send('/join ' + room, chat.activeRoom)
             .fail(function (e) {
                 ui.setActiveRoom('Lobby');
                 ui.addMessage(e, 'error');
@@ -685,7 +695,7 @@
     });
 
     $ui.bind(ui.events.closeRoom, function (ev, room) {
-        chat.send('/leave ' + room)
+        chat.send('/leave ' + room, chat.activeRoom)
             .fail(function (e) {
                 ui.addMessage(e, 'error');
             });
@@ -760,7 +770,8 @@
                 })
                 .done(function (success) {
                     if (success === false) {
-                        ui.addMessage('Choose a name using "/nick nickname password".', 'notification');
+                        ui.showLogin();
+                        ui.addMessage('Type /login to show the login screen', 'notification');
                     }
                     // get list of available commands
                     chat.getCommands()
@@ -769,6 +780,29 @@
                         });
                 });
         });
+
+        connection.hub.reconnected(function () {
+            if (checkingStatus === true) {
+                return;
+            }
+
+            checkingStatus = true;
+
+            chat.checkStatus()
+                .done(function (requiresUpdate) {
+                    if (requiresUpdate === true) {
+                        ui.showUpdateUI();
+                    }
+                })
+                .always(function () {
+                    checkingStatus = false;
+                });
+        });
+
+        connection.hub.disconnected(function () {
+            connection.hub.start();
+        });
+
     });
 
 })(jQuery, $.connection, window, window.chat.ui);

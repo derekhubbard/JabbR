@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text.RegularExpressions;
@@ -274,7 +274,39 @@ namespace JabbR.Services
             _crypto = crypto;
         }
 
-        public ChatUser AddUser(string userName, string clientId, string password)
+        public ChatUser AddUser(string userName, string identity, string email)
+        {
+            if (!IsValidUserName(userName))
+            {
+                throw new InvalidOperationException(String.Format("'{0}' is not a valid user name.", userName));
+            }
+
+            // This method is used in the auth workflow. If the username is taken it will add a number
+            // to the user name.
+            if (UserExists(userName))
+            {
+                var usersWithNameLikeMine = _repository.Users.Count(u => u.Name.StartsWith(userName));
+                userName += usersWithNameLikeMine;
+            }
+
+            var user = new ChatUser
+            {
+                Name = userName,
+                Status = (int)UserStatus.Active,
+                Email = email,
+                Hash = email.ToMD5(),
+                Identity = identity,
+                Id = Guid.NewGuid().ToString("d"),
+                LastActivity = DateTime.UtcNow
+            };
+
+            _repository.Add(user);
+            _repository.CommitChanges();
+
+            return user;
+        }
+
+        public ChatUser AddUser(string userName, string clientId, string userAgent, string password)
         {
             if (!IsValidUserName(userName))
             {
@@ -302,7 +334,7 @@ namespace JabbR.Services
 
             _repository.Add(user);
 
-            AddClient(user, clientId);
+            AddClient(user, clientId, userAgent);
 
             return user;
         }
@@ -424,15 +456,14 @@ namespace JabbR.Services
             _repository.CommitChanges();
         }
 
-        public void UpdateActivity(ChatUser user, string clientId)
+        public void UpdateActivity(ChatUser user, string clientId, string userAgent)
         {
             user.Status = (int)UserStatus.Active;
             user.LastActivity = DateTime.UtcNow;
 
-            if (!user.ConnectedClients.Any(c => c.Id == clientId))
-            {
-                AddClient(user, clientId);
-            }
+            ChatClient client = AddClient(user, clientId, userAgent);
+            client.UserAgent = userAgent;
+            client.LastActivity = DateTimeOffset.UtcNow;
 
             // Remove any Afk notes.
             if (user.IsAfk)
@@ -475,7 +506,7 @@ namespace JabbR.Services
             if (targetRoom.Owners.Contains(targetUser))
             {
                 // If the target user is already an owner, then throw
-                throw new InvalidOperationException(String.Format("'{0}' is already and owner of '{1}'.", targetUser.Name, targetRoom.Name));
+                throw new InvalidOperationException(String.Format("'{0}' is already an owner of '{1}'.", targetUser.Name, targetRoom.Name));
             }
 
             // Make the user an owner
@@ -532,16 +563,26 @@ namespace JabbR.Services
             LeaveRoom(targetUser, targetRoom);
         }
 
-        public void AddClient(ChatUser user, string clientId)
+        public ChatClient AddClient(ChatUser user, string clientId, string userAgent)
         {
-            var client = new ChatClient
+            ChatClient client = _repository.GetClientById(clientId);
+            if (client != null)
+            {
+                return client;
+            }
+
+            client = new ChatClient
             {
                 Id = clientId,
-                User = user
+                User = user,
+                UserAgent = userAgent,
+                LastActivity = DateTimeOffset.UtcNow
             };
 
             _repository.Add(client);
             _repository.CommitChanges();
+
+            return client;
         }
 
         public ChatUser DisconnectClient(string clientId)
@@ -577,12 +618,15 @@ namespace JabbR.Services
 
         private void EnsureUserNameIsAvailable(string userName)
         {
-            var userExists = _repository.Users.Any(u => u.Name.Equals(userName, StringComparison.OrdinalIgnoreCase));
-
-            if (userExists)
+            if (UserExists(userName))
             {
                 ThrowUserExists(userName);
             }
+        }
+
+        private bool UserExists(string userName)
+        {
+            return _repository.Users.Any(u => u.Name.Equals(userName, StringComparison.OrdinalIgnoreCase));
         }
 
         internal static string NormalizeUserName(string userName)
@@ -625,12 +669,12 @@ namespace JabbR.Services
 
         private static bool IsValidUserName(string name)
         {
-            return !String.IsNullOrEmpty(name) && Regex.IsMatch(name, "^[A-Za-z0-9-_.]{1,30}$");
+            return !String.IsNullOrEmpty(name) && Regex.IsMatch(name, "^[\\w-_.]{1,30}$");
         }
 
         private static bool IsValidRoomName(string name)
         {
-            return !String.IsNullOrEmpty(name) && Regex.IsMatch(name, "^[A-Za-z0-9-_.]{1,30}$");
+            return !String.IsNullOrEmpty(name) && Regex.IsMatch(name, "^[\\w-_]{1,30}$");
         }
 
         private static void EnsureOwner(ChatUser user, ChatRoom room)
@@ -764,6 +808,20 @@ namespace JabbR.Services
             // Make the room closed.
             targetRoom.Closed = true;
 
+            _repository.CommitChanges();
+        }
+
+        public void OpenRoom(ChatUser user, ChatRoom targetRoom)
+        {
+            EnsureOwner(user, targetRoom);
+
+            if (!targetRoom.Closed)
+            {
+                throw new InvalidOperationException(string.Format("{0} is already open.", targetRoom.Name));
+            }
+
+            // Open the room
+            targetRoom.Closed = false;
             _repository.CommitChanges();
         }
 

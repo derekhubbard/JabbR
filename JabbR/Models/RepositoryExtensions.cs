@@ -55,13 +55,14 @@ namespace JabbR.Models
 
             if (user == null)
             {
-                throw new InvalidOperationException("You don't have a name. Pick a name using '/nick nickname'.");
+                // The user isn't logged in 
+                throw new InvalidOperationException("You're not logged in.");
             }
 
             return user;
         }
 
-        public static ChatRoom VerifyRoom(this IJabbrRepository repository, string roomName)
+        public static ChatRoom VerifyRoom(this IJabbrRepository repository, string roomName, bool mustBeOpen = true)
         {
             if (String.IsNullOrWhiteSpace(roomName))
             {
@@ -77,7 +78,7 @@ namespace JabbR.Models
                 throw new InvalidOperationException(String.Format("Unable to find room '{0}'", roomName));
             }
 
-            if (room.Closed)
+            if (room.Closed && mustBeOpen)
             {
                 throw new InvalidOperationException(String.Format("The room '{0}' is closed", roomName));
             }

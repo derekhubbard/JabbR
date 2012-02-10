@@ -22,15 +22,29 @@ namespace JabbR
         private readonly IJabbrRepository _repository;
         private readonly IChatService _service;
         private readonly IResourceProcessor _resourceProcessor;
+        private readonly IApplicationSettings _settings;
 
-        public Chat(IResourceProcessor resourceProcessor, IChatService service, IJabbrRepository repository)
+        public Chat(IApplicationSettings settings, IResourceProcessor resourceProcessor, IChatService service, IJabbrRepository repository)
         {
+            _settings = settings;
             _resourceProcessor = resourceProcessor;
             _service = service;
             _repository = repository;
         }
 
-        public bool OutOfSync
+        private string UserAgent
+        {
+            get
+            {
+                if (Context.Headers != null)
+                {
+                    return Context.Headers["User-Agent"];
+                }
+                return null;
+            }
+        }
+
+        private bool OutOfSync
         {
             get
             {
@@ -42,8 +56,7 @@ namespace JabbR
 
         public bool Join()
         {
-            // Set the version on the client
-            Caller.version = typeof(Chat).Assembly.GetName().Version.ToString();
+            SetVersion();
 
             // Get the client state
             ClientState clientState = GetClientState();
@@ -57,13 +70,69 @@ namespace JabbR
                 return false;
             }
 
+            // Migrate all users to use new auth
+            if (!String.IsNullOrEmpty(_settings.AuthApiKey) &&
+                String.IsNullOrEmpty(user.Identity))
+            {
+                return false;
+            }
+
             // Update some user values
-            _service.UpdateActivity(user, Context.ConnectionId);
+            _service.UpdateActivity(user, Context.ConnectionId, UserAgent);
             _repository.CommitChanges();
 
             OnUserInitialize(clientState, user);
 
             return true;
+        }
+
+        private void SetVersion()
+        {
+            // Set the version on the client
+            Caller.version = typeof(Chat).Assembly.GetName().Version.ToString();
+        }
+
+        public bool CheckStatus()
+        {
+            bool outOfSync = OutOfSync;
+
+            SetVersion();
+
+            string id = Caller.id;
+
+            ChatUser user = _repository.VerifyUserId(id);
+
+            // Make sure this client is being tracked
+            _service.AddClient(user, Context.ConnectionId, UserAgent);
+
+            var currentStatus = (UserStatus)user.Status;
+
+            if (currentStatus == UserStatus.Offline)
+            {
+                // Mark the user as inactive
+                user.Status = (int)UserStatus.Inactive;
+                _repository.CommitChanges();
+
+                // If the user was offline that means they are not in the user list so we need to tell
+                // everyone the user is really in the room
+                var userViewModel = new UserViewModel(user);
+
+                foreach (var room in user.Rooms)
+                {
+                    var isOwner = user.OwnedRooms.Contains(room);
+
+                    // Tell the people in this room that you've joined
+                    Clients[room.Name].addUser(userViewModel, room.Name, isOwner).Wait();
+
+                    // Update the room count
+                    OnRoomChanged(room);
+
+                    // Add the caller to the group so they receive messages
+                    GroupManager.AddToGroup(Context.ConnectionId, room.Name).Wait();
+                }
+            }
+
+            return outOfSync;
         }
 
         private void OnUserInitialize(ClientState clientState, ChatUser user)
@@ -78,24 +147,21 @@ namespace JabbR
             LogOn(user, Context.ConnectionId);
         }
 
-        public void Send(string content)
+        public bool Send(string content, string roomName)
         {
-            // If the client and server are out of sync then tell the client to refresh
-            if (OutOfSync)
-            {
-                throw new InvalidOperationException("Chat was just updated, please refresh your browser");
-            }
+            bool outOfSync = OutOfSync;
+
+            SetVersion();
 
             // Sanitize the content (strip and bad html out)
             content = HttpUtility.HtmlEncode(content);
 
             // See if this is a valid command (starts with /)
-            if (TryHandleCommand(content))
+            if (TryHandleCommand(content, roomName))
             {
-                return;
+                return outOfSync;
             }
 
-            string roomName = Caller.activeRoom;
             string id = Caller.id;
 
             ChatUser user = _repository.VerifyUserId(id);
@@ -116,10 +182,19 @@ namespace JabbR
 
             if (!links.Any())
             {
-                return;
+                return outOfSync;
             }
 
             ProcessUrls(links, room, chatMessage);
+
+            return outOfSync;
+        }
+
+        // TODO: Deprecate
+        public bool Send(string content)
+        {
+            string roomName = Caller.activeRoom;
+            return Send(content, roomName);
         }
 
         private string ParseChatMessageText(string content, out HashSet<string> links)
@@ -129,9 +204,20 @@ namespace JabbR
             return TextTransform.TransformAndExtractUrls(message, out links);
         }
 
-        public void Disconnect()
+        public UserViewModel GetUserInfo()
+        {
+            string id = Caller.id;
+
+            ChatUser user = _repository.VerifyUserId(id);
+
+            return new UserViewModel(user);
+        }
+
+        public Task Disconnect()
         {
             DisconnectClient(Context.ConnectionId);
+
+            return null;
         }
 
         public object GetCommands()
@@ -222,21 +308,17 @@ namespace JabbR
             };
         }
 
-        public void Typing(bool isTyping)
+        // TODO: Deprecate
+        public void Typing()
         {
-            if (OutOfSync)
-            {
-                return;
-            }
-
-            string id = Caller.id;
             string roomName = Caller.activeRoom;
 
-            if (String.IsNullOrEmpty(id))
-            {
-                return;
-            }
+            Typing(roomName);
+        }
 
+        public void Typing(string roomName)
+        {
+            string id = Caller.id;
             ChatUser user = _repository.GetUserById(id);
 
             if (user == null)
@@ -246,27 +328,9 @@ namespace JabbR
 
             ChatRoom room = _repository.VerifyUserRoom(user, roomName);
 
-            if (isTyping)
-            {
-                UpdateActivity(user, room);
-                var userViewModel = new UserViewModel(user);
-                Clients[room.Name].setTyping(userViewModel, room.Name, true);
-            }
-            else
-            {
-                SetTypingIndicatorOff(user);
-            }
-        }
-
-        private void SetTypingIndicatorOff(ChatUser user)
-        {
+            UpdateActivity(user, room);
             var userViewModel = new UserViewModel(user);
-
-            // Set the typing indicator off in all rooms
-            foreach (var r in user.Rooms)
-            {
-                Clients[r.Name].setTyping(userViewModel, r.Name, false);
-            }
+            Clients[room.Name].setTyping(userViewModel, room.Name);
         }
 
         private void LogOn(ChatUser user, string clientId)
@@ -288,9 +352,6 @@ namespace JabbR
                 // Update the room count
                 OnRoomChanged(room);
 
-                // Update activity
-                UpdateActivity(user, room);
-
                 // Add the caller to the group so they receive messages
                 GroupManager.AddToGroup(clientId, room.Name).Wait();
 
@@ -308,11 +369,16 @@ namespace JabbR
 
         private void UpdateActivity(ChatUser user, ChatRoom room)
         {
-            _service.UpdateActivity(user, Context.ConnectionId);
-
-            _repository.CommitChanges();
+            UpdateActivity(user);
 
             OnUpdateActivity(user, room);
+        }
+
+        private void UpdateActivity(ChatUser user)
+        {
+            _service.UpdateActivity(user, Context.ConnectionId, UserAgent);
+
+            _repository.CommitChanges();
         }
 
         private void ProcessUrls(IEnumerable<string> links, ChatRoom room, ChatMessage chatMessage)
@@ -350,13 +416,12 @@ namespace JabbR
             });
         }
 
-        private bool TryHandleCommand(string command)
+        private bool TryHandleCommand(string command, string room)
         {
             string clientId = Context.ConnectionId;
             string userId = Caller.id;
-            string room = Caller.activeRoom;
 
-            var commandManager = new CommandManager(clientId, userId, room, _service, _repository, this);
+            var commandManager = new CommandManager(clientId, UserAgent, userId, room, _service, _repository, this);
             return commandManager.TryHandleCommand(command);
         }
 
@@ -369,9 +434,6 @@ namespace JabbR
             {
                 return;
             }
-
-            // Turn the typing indicator off for this user (even if it's just one client)
-            SetTypingIndicatorOff(user);
 
             // The user will be marked as offline if all clients leave
             if (user.Status == (int)UserStatus.Offline)
@@ -669,6 +731,9 @@ namespace JabbR
                     .Select(r => r.Name),
                 Status = ((UserStatus)user.Status).ToString(),
                 LastActivity = user.LastActivity,
+                IsAfk = user.IsAfk,
+                AfkNote = user.AfkNote,
+                Note = user.Note,
                 Rooms = user.Rooms.Allowed(userId).Select(r => r.Name)
             });
         }
@@ -757,7 +822,7 @@ namespace JabbR
             {
                 Clients[client.Id].flagChanged(isFlagCleared, userViewModel.Country);
             }
-                                    
+
             // Tell all users in rooms to change the flag
             foreach (var room in user.Rooms)
             {

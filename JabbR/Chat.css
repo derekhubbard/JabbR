@@ -33,6 +33,15 @@
     height: 18px;
 }
 
+#users-filter {
+    display: none;
+    position: absolute;
+    top: 55px;
+    width:15%;
+    left: 71%;
+    margin-top: 4px;
+}
+
 #preferences a {
     cursor: pointer;
 }
@@ -133,9 +142,23 @@
     overflow: auto;
 }
 
+#userlist-lobby {
+    top: 85px;
+}
+.users ul
+{
+    margin-left: 0px;
+    padding-left: 0px;
+    margin-top: 0px;
+}
 .users li {
     padding: 4px;
     list-style: none;
+}
+.users li.empty
+{
+    color: #909090;
+    font-style: italic;
 }
 
 .users li .name {
@@ -493,6 +516,10 @@ li.room:hover {
 .collapsible_box {
     border: 1px solid #DDD;
     padding: 5px;
+}
+
+.collapsible_box img, .collapsible_box embed {
+	max-width:100%;
 }
 
 pre.multiline {
